@@ -15,6 +15,7 @@
         , fd_from_binary/1
         , getsockopt/2
         , setsockopt/3
+        , monitor/2
         ]).
 
 -on_load(init/0).
@@ -75,6 +76,10 @@ getsockopt(Socket, Option) ->
 
 setsockopt(Socket, Option, Value) ->
     erlang:nif_error(not_loaded, [Socket, Option, Value]).
+
+
+monitor(Socket, What) ->
+    erlang:nif_error(not_loaded, [Socket, What]).
 
 
 init() ->
