@@ -41,15 +41,13 @@ send_receive_fd_test() ->
     C = socket(),
     ok = connect(C, Path),
 
-    Fd = memfd:create(),
+    Fd = memfd:new(),
     ok = memfd:pwrite(Fd, bof, <<1,2,3,4>>),
-    FdBin = memfd:fd_to_binary(Fd),
-    ok = send(C, [afunix:fd_from_binary(FdBin)], <<"data">>),
+    ok = send(C, [afunix:fd_from_binary(memfd:fd(Fd))], <<"data">>),
 
     {ok, C1} = accept(S),
     {ok, [Fd1], <<"data">>} = recv(C1, 100),
-    Fd1Bin = afunix:fd_to_binary(Fd1),
-    MemFd = memfd:fd_from_binary(Fd1Bin),
+    MemFd = memfd:new(afunix:fd_to_binary(Fd1)),
     ?assertMatch({ok, <<1,2,3,4>>}, memfd:pread(MemFd, 0, 4)).
 
 
