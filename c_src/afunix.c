@@ -8,6 +8,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stdbool.h>
+#include <stdio.h>
 #include <string.h>
 
 #include <erl_nif.h>
@@ -26,40 +27,9 @@ static ERL_NIF_TERM atom_false;
 static ERL_NIF_TERM atom_noerror;
 static ERL_NIF_TERM atom_recbuf;
 static ERL_NIF_TERM atom_sndbuf;
-static ERL_NIF_TERM atom_afunix;
-static ERL_NIF_TERM atom_read;
-static ERL_NIF_TERM atom_write;
-
-
-typedef struct monitor_data
-{
-    struct monitor_data* next;
-    int socket;
-    enum { MONITOR_NONE // socket is garbage collected, do not send notification
-         , MONITOR_READ // send notification when socket is readable
-         , MONITOR_WRITE // send notification when socket is writable
-         , MONITOR_CLOSED // close is called, send notification and expect
-                          // next API call to fail with {error, closed}
-         } event;
-
-    ErlNifEnv *env;
-    ErlNifPid pid;
-    ERL_NIF_TERM msg;
-
-} monitor_data;
-
-
-typedef struct {
-    int pipefd[2];
-    ErlNifMutex *lock;
-    ErlNifCond *cond;
-
-    ErlNifTid tid;
-    bool running;
-
-    monitor_data* monitors;
-
-} afunix_data;
+static ERL_NIF_TERM atom_input;
+static ERL_NIF_TERM atom_output;
+static ERL_NIF_TERM atom_undefined;
 
 
 typedef struct {
@@ -69,61 +39,21 @@ typedef struct {
 } socket_data;
 
 
-typedef struct {
-    int nfds;
-    int pipefd;
-    fd_set rfds, wfds;
-} select_data;
-
-
-static afunix_data* priv_data(ErlNifEnv* env)
+static int safe_close(ErlNifEnv *env, socket_data *sd)
 {
-    return (afunix_data *) enif_priv_data(env);
-}
+    if (sd->fd == -1) return 0;
 
+    int rc = enif_select(env, sd->fd, ERL_NIF_SELECT_STOP, sd, NULL,
+                         atom_undefined);
 
-// lock must be held
-static void wakeup_select_thread(afunix_data* data)
-{
-    char buf = 0;
-    write(data->pipefd[1], &buf, 1);
-}
+    if (rc > 0 && ((rc & ERL_NIF_SELECT_STOP_CALLED)
+                   || (rc & ERL_NIF_SELECT_STOP_SCHEDULED)))
+        return 0;
 
+    int fd = sd->fd;
+    sd->fd = -1;
 
-static void cancel_monitors(ErlNifEnv *env, socket_data *sd, bool notify)
-{
-    afunix_data* data = priv_data(env);
-
-    enif_mutex_lock(data->lock);
-
-    bool has_monitors = false;
-
-    monitor_data* mon = data->monitors;
-    while (mon != NULL) {
-        if (mon->socket == sd->fd) {
-            has_monitors = true;
-            mon->event = notify ? MONITOR_CLOSED : MONITOR_NONE;
-        }
-
-        mon = mon->next;
-    }
-
-    while (has_monitors) {
-        wakeup_select_thread(data);
-        enif_cond_wait(data->cond, data->lock);
-
-        has_monitors = false;
-        mon = data->monitors;
-        while (mon != NULL) {
-            if (mon->socket == sd->fd) {
-                has_monitors = true;
-                break;
-            }
-            mon = mon->next;
-        }
-    }
-
-    enif_mutex_unlock(data->lock);
+    return close(fd);
 }
 
 
@@ -131,13 +61,21 @@ static void socket_dtor(ErlNifEnv *env, void *obj)
 {
     socket_data *sd = (socket_data *) obj;
 
-    if (sd->fd == -1) return;
-
-    cancel_monitors(env, sd, false);
-
-    close(sd->fd);
+    safe_close(env, sd);
 
     if (sd->unlink) unlink(sd->addr.sun_path);
+}
+
+
+static void socket_stop(ErlNifEnv* env, void* obj, ErlNifEvent event,
+                        int is_direct_call)
+{
+    socket_data *sd = (socket_data *) obj;
+
+    if (sd->fd == -1) return;
+
+    close(sd->fd);
+    sd->fd = -1;
 }
 
 
@@ -160,8 +98,12 @@ static bool make_fd_nonblock(int fd)
 
 static bool init_resource_types(ErlNifEnv* env, ErlNifResourceFlags flags)
 {
-    socket_type = enif_open_resource_type(env, NULL, "socket", socket_dtor,
-                                          flags, NULL);
+    ErlNifResourceTypeInit init;
+    init.dtor = socket_dtor;
+    init.stop = socket_stop;
+    init.down = NULL;
+
+    socket_type = enif_open_resource_type_x(env, "socket", &init, flags, NULL);
     fd_type = enif_open_resource_type(env, NULL, "fd", fd_dtor, flags, NULL);
 
     return socket_type && fd_type;
@@ -178,276 +120,9 @@ static void init_atoms(ErlNifEnv* env)
     atom_recbuf = enif_make_atom(env, "recbuf");
     atom_sndbuf = enif_make_atom(env, "sndbuf");
     atom_noerror = enif_make_atom(env, "noerror");
-    atom_afunix = enif_make_atom(env, "afunix");
-    atom_read = enif_make_atom(env, "read");
-    atom_write = enif_make_atom(env, "write");
-}
-
-
-static afunix_data* init_priv_data()
-{
-    int error;
-    afunix_data *data = (afunix_data *) enif_alloc(sizeof(afunix_data));
-
-    data->pipefd[0] = -1;
-    data->pipefd[1] = -1;
-    data->lock = NULL;
-    data->cond = NULL;
-    data->running = false;
-    data->monitors = NULL;
-
-    if (pipe(data->pipefd) != 0) goto ERROR;
-
-    if (!make_fd_nonblock(data->pipefd[0]) ||
-        !make_fd_nonblock(data->pipefd[1]))
-        goto ERROR;
-
-    data->lock = enif_mutex_create("afunix");
-    if (data->lock == NULL) goto ERROR;
-
-    data->cond = enif_cond_create("afunix");
-    if (data->cond == NULL) goto ERROR;
-
-    return data;
-
-ERROR:
-        error = errno;
-
-        if (data->pipefd[0] != -1) close(data->pipefd[0]);
-        if (data->pipefd[1] != -1) close(data->pipefd[1]);
-
-        if (data->cond != NULL) enif_cond_destroy(data->cond);
-        if (data->lock != NULL) enif_mutex_destroy(data->lock);
-
-        enif_free(data);
-
-        errno = error;
-
-        return NULL;
-}
-
-
-static void upgrade_priv_data(afunix_data *old_data, afunix_data* new_data)
-{
-    enif_mutex_lock(old_data->lock);
-    enif_mutex_lock(new_data->lock);
-
-
-    enif_mutex_unlock(new_data->lock);
-    enif_mutex_unlock(old_data->lock);
-}
-
-
-static void free_priv_data(afunix_data* data)
-{
-    close(data->pipefd[0]);
-    close(data->pipefd[1]);
-
-    enif_cond_destroy(data->cond);
-    enif_mutex_destroy(data->lock);
-
-    enif_free(data);
-}
-
-
-static monitor_data*
-init_monitor_data(ErlNifEnv* env, socket_data* sd, int event, ERL_NIF_TERM ref)
-{
-    monitor_data* mon = enif_alloc(sizeof(monitor_data));
-
-    if (mon != NULL) {
-        mon->env = enif_alloc_env();
-        if (mon->env == NULL) {
-            enif_free(mon);
-            return NULL;
-        }
-
-        mon->next = NULL;
-        mon->socket = sd->fd;
-        mon->event = event;
-
-        ERL_NIF_TERM mon_afunix, mon_ref;
-
-        mon_afunix = enif_make_copy(mon->env, atom_afunix);
-        mon_ref = enif_make_copy(mon->env, ref);
-
-        mon->msg = enif_make_tuple2(mon->env, mon_afunix, mon_ref);
-
-        enif_self(env, &mon->pid);
-    }
-
-    return mon;
-}
-
-
-static void free_monitor_data(monitor_data* mon)
-{
-    enif_free_env(mon->env);
-    enif_free(mon);
-}
-
-
-static void init_select(select_data* sdata, afunix_data* adata)
-{
-    enif_mutex_lock(adata->lock);
-
-    sdata->pipefd = adata->pipefd[0];
-    sdata->nfds = sdata->pipefd + 1;
-
-    enif_mutex_unlock(adata->lock);
-
-    FD_ZERO(&sdata->rfds);
-    FD_SET(sdata->pipefd, &sdata->rfds);
-
-    FD_ZERO(&sdata->wfds);
-}
-
-
-static void drain_wakeup_pipe(select_data* data)
-{
-    if (FD_ISSET(data->pipefd, &data->rfds)) {
-        char buf;
-        int rc;
-        do {
-            rc = read(data->pipefd, &buf, 1);
-        } while(rc == 1 || (rc == -1 && errno == EINTR));
-    }
-}
-
-
-static void send_notifications(select_data* sdata, afunix_data* adata)
-{
-    enif_mutex_lock(adata->lock);
-
-    monitor_data** monptr = &adata->monitors;
-
-    while (*monptr != NULL) {
-        monitor_data* mon = *monptr;
-
-        if (FD_ISSET(mon->socket, &sdata->rfds) ||
-            FD_ISSET(mon->socket, &sdata->wfds)) {
-
-            if (mon->event != MONITOR_NONE)
-                enif_send(NULL, &mon->pid, mon->env, mon->msg);
-
-            monitor_data* next = mon->next;
-            free_monitor_data(mon);
-            *monptr = next;
-
-        } else {
-            monptr = &(mon->next);
-        }
-    }
-
-    enif_mutex_unlock(adata->lock);
-}
-
-
-static bool update_select(select_data* sdata, afunix_data* adata)
-{
-    enif_mutex_lock(adata->lock);
-
-    if (!adata->running) {
-        enif_mutex_unlock(adata->lock);
-        return false;
-    }
-
-    FD_ZERO(&sdata->rfds);
-    FD_SET(sdata->pipefd, &sdata->rfds);
-
-    FD_ZERO(&sdata->wfds);
-
-    sdata->nfds = sdata->pipefd;
-
-    monitor_data** monptr = &adata->monitors;
-    bool monitors_freed = false;
-
-    while (*monptr != NULL) {
-        monitor_data* mon = *monptr;
-
-        switch (mon->event) {
-        case MONITOR_READ:
-            FD_SET(mon->socket, &sdata->rfds);
-            break;
-        case MONITOR_WRITE:
-            FD_SET(mon->socket, &sdata->wfds);
-            break;
-        case MONITOR_CLOSED:
-            enif_send(NULL, &mon->pid, mon->env, mon->msg);
-            // fall-through to delete monitor data
-        case MONITOR_NONE: { // socket destructor waiting
-            monitors_freed = true;
-            monitor_data* next = mon->next;
-            free_monitor_data(mon);
-            *monptr = next;
-            continue;
-        }
-        }
-
-        if (mon->socket > sdata->nfds) sdata->nfds = mon->socket;
-
-        monptr = &(mon->next);
-    }
-
-    if (monitors_freed) enif_cond_broadcast(adata->cond);
-
-    enif_mutex_unlock(adata->lock);
-
-    sdata->nfds += 1;
-
-    return true;
-}
-
-
-static void* select_thread(void* arg)
-{
-    select_data data;
-    init_select(&data, (afunix_data*) arg);
-
-    do {
-        int rc = select(data.nfds, &data.rfds, &data.wfds, NULL, NULL);
-        if (rc == -1 && errno == EINTR) continue;
-
-        assert(rc != -1);
-
-        drain_wakeup_pipe(&data);
-        send_notifications(&data, (afunix_data*) arg);
-
-    } while (update_select(&data, (afunix_data*) arg));
-
-    return NULL;
-}
-
-
-static bool start_select_thread(afunix_data* data)
-{
-    enif_mutex_lock(data->lock);
-
-    if (enif_thread_create("afunix", &data->tid, select_thread, data, 0) != 0) {
-        enif_mutex_unlock(data->lock);
-        return false;
-    }
-
-    data->running = true;
-    enif_mutex_unlock(data->lock);
-
-    return true;
-}
-
-
-static void stop_select_thread(afunix_data* data)
-{
-    enif_mutex_lock(data->lock);
-
-    assert(data->running);
-
-    data->running = false;
-
-    wakeup_select_thread(data);
-
-    enif_mutex_unlock(data->lock);
-
-    enif_thread_join(data->tid, NULL);
+    atom_input = enif_make_atom(env, "input");
+    atom_output = enif_make_atom(env, "output");
+    atom_undefined = enif_make_atom(env, "undefined");
 }
 
 
@@ -862,12 +537,9 @@ close_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
     if (*fd == -1)
         return enif_make_tuple2(env, atom_error, atom_closed);
 
-    if (sd != NULL) cancel_monitors(env, sd, true);
-
-    if (close(*fd) == -1)
+    if (safe_close(env, sd) == -1)
         return errno_error(env, errno);
 
-    *fd = -1;
     return atom_ok;
 }
 
@@ -956,67 +628,33 @@ setsockopt_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
 
 
 static ERL_NIF_TERM
-monitor_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
+select_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
 {
-    afunix_data *data = priv_data(env);
-
     socket_data *sd;
     if (!get_socket(env, argv[0], &sd)) return enif_make_badarg(env);
 
-    int event;
-    if (enif_is_identical(argv[1], atom_read))
-        event = MONITOR_READ;
-    else if (enif_is_identical(argv[1], atom_write))
-        event = MONITOR_WRITE;
+    enum ErlNifSelectFlags mode;
+    if (enif_is_identical(argv[1], atom_input))
+        mode = ERL_NIF_SELECT_READ;
+    else if (enif_is_identical(argv[1], atom_output))
+        mode = ERL_NIF_SELECT_WRITE;
     else
        return enif_make_badarg(env);
 
-    ERL_NIF_TERM ref = enif_make_ref(env);
+    int rc = enif_select(env, sd->fd, mode, sd, NULL, argv[2]);
 
-    enif_mutex_lock(data->lock);
-
-    monitor_data* mon = init_monitor_data(env, sd, event, ref);
-
-    if (mon == NULL) {
-        enif_mutex_unlock(data->lock);
-        return enif_make_badarg(env);
-    }
-
-    monitor_data** monptr = &data->monitors;
-
-    while (*monptr != NULL) monptr = &((*monptr)->next);
-
-    *monptr = mon;
-
-    wakeup_select_thread(data);
-
-    enif_mutex_unlock(data->lock);
-
-    return ref;
+    return rc >= 0 ? atom_ok : atom_error;
 }
 
 
 static int onload(ErlNifEnv *env, void **priv_data, ERL_NIF_TERM load_info)
 {
-    ErlNifSysInfo sys_info;
-    enif_system_info(&sys_info, sizeof(ErlDrvSysInfo));
-
-    if (!sys_info.smp_support) return -1;
-
     if (!init_resource_types(env, ERL_NIF_RT_CREATE))
         return -1;
 
     init_atoms(env);
 
-    afunix_data* data = init_priv_data();
-
-    if (data != NULL && !start_select_thread(data)) {
-        free_priv_data(data);
-        data = NULL;
-    }
-
-    *priv_data = data;
-    return data != NULL ? 0 : -1;
+    return 0;
 }
 
 
@@ -1028,26 +666,7 @@ static int upgrade(ErlNifEnv* env, void** priv_data, void** old_priv_data,
 
     init_atoms(env);
 
-    afunix_data* data = init_priv_data();
-
-    if (data != NULL) {
-        if (start_select_thread(data)) {
-            upgrade_priv_data(*old_priv_data, data);
-        } else {
-            free_priv_data(data);
-            data = NULL;
-        }
-    }
-
-    *priv_data = data;
-    return data != NULL ? 0 : -1;
-}
-
-
-static void unload(ErlNifEnv *env, void *priv_data)
-{
-    stop_select_thread((afunix_data *) priv_data);
-    free_priv_data((afunix_data *) priv_data);
+    return 0;
 }
 
 
@@ -1064,8 +683,8 @@ static ErlNifFunc nifs[] =
     {"close",         1, close_nif},
     {"getsockopt",    2, getsockopt_nif},
     {"setsockopt",    3, setsockopt_nif},
-    {"monitor",       2, monitor_nif},
+    {"select",        3, select_nif},
 };
 
 
-ERL_NIF_INIT(afunix,nifs,onload,NULL,upgrade,unload)
+ERL_NIF_INIT(afunix,nifs,onload,NULL,upgrade,NULL)
