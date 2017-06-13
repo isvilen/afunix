@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/socket.h>
@@ -656,6 +657,33 @@ select_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
 }
 
 
+static ERL_NIF_TERM
+credentials_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
+{
+    socket_data *sd;
+    if (!get_socket(env, argv[0], &sd)) return enif_make_badarg(env);
+
+    if (sd->fd == -1) return closed_error(env);
+
+    struct ucred creds;
+    socklen_t credslen = sizeof(struct ucred);
+
+    if (getsockopt(sd->fd, SOL_SOCKET, SO_PEERCRED, &creds, &credslen) == -1) {
+        return errno_exception(env, errno);
+    }
+
+    if (creds.pid == 0) {
+        return enif_make_tuple2(env, atom_ok, atom_undefined);
+    }
+
+    ERL_NIF_TERM pid = enif_make_long(env, creds.pid);
+    ERL_NIF_TERM uid = enif_make_long(env, creds.uid);
+    ERL_NIF_TERM gid = enif_make_long(env, creds.gid);
+    ERL_NIF_TERM creds_term = enif_make_tuple3(env, pid, uid, gid);
+    return enif_make_tuple2(env, atom_ok, creds_term);
+}
+
+
 static int onload(ErlNifEnv *env, void **priv_data, ERL_NIF_TERM load_info)
 {
     if (!init_resource_types(env, ERL_NIF_RT_CREATE))
@@ -693,6 +721,7 @@ static ErlNifFunc nifs[] =
     {"getsockopt",    2, getsockopt_nif},
     {"setsockopt",    3, setsockopt_nif},
     {"select",        3, select_nif},
+    {"credentials",   1, credentials_nif},
 };
 
 

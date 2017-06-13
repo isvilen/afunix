@@ -14,6 +14,7 @@
         , getsockopt/2
         , setsockopt/3
         , select/3
+        , credentials/1
         ]).
 
 -on_load(init/0).
@@ -71,6 +72,10 @@ setsockopt(Socket, Option, Value) ->
 
 select(Socket, What, Ref) ->
     erlang:nif_error(not_loaded, [Socket, What, Ref]).
+
+
+credentials(Socket) ->
+    erlang:nif_error(not_loaded, [Socket]).
 
 
 init() ->
