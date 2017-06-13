@@ -43,11 +43,11 @@ send_receive_fd_test() ->
 
     Fd = memfd:new(),
     ok = memfd:pwrite(Fd, bof, <<1,2,3,4>>),
-    ok = send(C, [afunix:fd_from_binary(memfd:fd(Fd))], <<"data">>),
+    ok = send(C, [memfd:fd(Fd)], <<"data">>),
 
     {ok, C1} = accept(S),
     {ok, [Fd1], <<"data">>} = recv(C1, 100),
-    MemFd = memfd:new(afunix:fd_to_binary(Fd1)),
+    MemFd = memfd:new(Fd1),
     ?assertMatch({ok, <<1,2,3,4>>}, memfd:pread(MemFd, 0, 4)).
 
 

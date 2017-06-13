@@ -481,21 +481,22 @@ static ERL_NIF_TERM alloc_fd(ErlNifEnv* env, int fd)
     int *res = enif_alloc_resource(fd_type, sizeof(int));
     *res = fd;
 
-    ERL_NIF_TERM fd_term = enif_make_resource(env, res);
+    ERL_NIF_TERM fd_term = enif_make_resource_binary(env, res, res, sizeof(int));
     enif_release_resource(res);
 
     return fd_term;
 }
 
 
-static bool get_fd(ErlNifEnv* env, ERL_NIF_TERM term, int** fd)
+static bool get_fd(ErlNifEnv* env, ERL_NIF_TERM term, int* fd)
 {
-    void *res;
-    if (!enif_get_resource(env, term, fd_type, &res)) return false;
+    ErlNifBinary bin;
+    if (!enif_inspect_binary(env, term, &bin) || bin.size != sizeof(int))
+        return false;
 
-    *fd = (int *)res;
+    *fd = *(int* )bin.data;
 
-    return true;
+    return fcntl(*fd, F_GETFD) != -1;
 }
 
 
@@ -722,14 +723,14 @@ send_fd_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
 
     ERL_NIF_TERM fd_list = argv[1];
     ERL_NIF_TERM fd_cell;
-    int *fdptr;
+    int fd;
     unsigned fd_idx = 0;
 
     while (enif_get_list_cell(env, fd_list, &fd_cell, &fd_list)) {
-        if (!get_fd(env, fd_cell, &fdptr) || *fdptr == -1)
+        if (!get_fd(env, fd_cell, &fd))
             return enif_make_badarg(env);
 
-        fds[fd_idx++] = *fdptr;
+        fds[fd_idx++] = fd;
     }
 
     union {
@@ -744,7 +745,7 @@ send_fd_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
     cmsg->cmsg_type = SCM_RIGHTS;
     cmsg->cmsg_len = CMSG_LEN(sizeof(int) * num_fd);
 
-    fdptr = (int *) CMSG_DATA(cmsg);
+    int* fdptr = (int *) CMSG_DATA(cmsg);
     memcpy(fdptr, fds, num_fd * sizeof(int));
 
     struct iovec iov[1];
@@ -855,7 +856,7 @@ close_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
 
     if (get_socket(env, argv[0], &sd))
         fd = &sd->fd;
-    else if (!get_fd(env, argv[0], &fd))
+    else
         return enif_make_badarg(env);
 
     if (*fd == -1)
@@ -868,32 +869,6 @@ close_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
 
     *fd = -1;
     return atom_ok;
-}
-
-
-static ERL_NIF_TERM
-fd_to_bin_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
-{
-    int *fd;
-    if (!get_fd(env, argv[0], &fd) || *fd == -1) return enif_make_badarg(env);
-
-    return enif_make_resource_binary(env, fd, fd, sizeof(int));
-}
-
-
-static ERL_NIF_TERM
-fd_from_bin_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
-{
-    ErlNifBinary bin;
-    if (!enif_inspect_binary(env, argv[0], &bin) || bin.size != sizeof(int))
-        return enif_make_badarg(env);
-
-    int old_fd = *(int* )bin.data;
-
-    int new_fd = dup(old_fd);
-    if (new_fd == -1) return enif_make_badarg(env);
-
-    return alloc_fd(env, new_fd);
 }
 
 
@@ -1087,8 +1062,6 @@ static ErlNifFunc nifs[] =
     {"send",          3, send_fd_nif},
     {"recv",          2, recv_nif},
     {"close",         1, close_nif},
-    {"fd_to_binary",  1, fd_to_bin_nif},
-    {"fd_from_binary",1, fd_from_bin_nif},
     {"getsockopt",    2, getsockopt_nif},
     {"setsockopt",    3, setsockopt_nif},
     {"monitor",       2, monitor_nif},

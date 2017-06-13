@@ -11,8 +11,6 @@
         , send/3
         , recv/2
         , close/1
-        , fd_to_binary/1
-        , fd_from_binary/1
         , getsockopt/2
         , setsockopt/3
         , monitor/2
@@ -62,13 +60,6 @@ recv(Socket, Len) ->
 
 close(Socket) ->
     erlang:nif_error(not_loaded, [Socket]).
-
-
-fd_to_binary(Fd) ->
-    erlang:nif_error(not_loaded, [Fd]).
-
-fd_from_binary(Bin) ->
-    erlang:nif_error(not_loaded, [Bin]).
 
 
 getsockopt(Socket, Option) ->
