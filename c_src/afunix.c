@@ -39,6 +39,25 @@ typedef struct {
 } socket_data;
 
 
+static ERL_NIF_TERM errno_error(ErlNifEnv* env, int error) {
+    ERL_NIF_TERM reason = enif_make_atom(env, erl_errno_id(error));
+
+    return enif_make_tuple2(env, atom_error, reason);
+}
+
+
+static ERL_NIF_TERM closed_error(ErlNifEnv* env) {
+    return enif_make_tuple2(env, atom_error, atom_closed);
+}
+
+
+static ERL_NIF_TERM errno_exception(ErlNifEnv* env, int error) {
+    ERL_NIF_TERM reason = enif_make_atom(env, erl_errno_id(errno));
+
+    return enif_raise_exception(env, reason);
+}
+
+
 static int safe_close(ErlNifEnv *env, socket_data *sd)
 {
     if (sd->fd == -1) return 0;
@@ -79,6 +98,15 @@ static void socket_stop(ErlNifEnv* env, void* obj, ErlNifEvent event,
 }
 
 
+static void socket_down(ErlNifEnv* env, void* obj, ErlNifPid* pid,
+                        ErlNifMonitor* mon)
+{
+    socket_data *sd = (socket_data *) obj;
+
+    safe_close(env, sd);
+}
+
+
 static void fd_dtor(ErlNifEnv *env, void *obj)
 {
     int *fd = (int *) obj;
@@ -87,21 +115,12 @@ static void fd_dtor(ErlNifEnv *env, void *obj)
 }
 
 
-static bool make_fd_nonblock(int fd)
-{
-    int flags = fcntl(fd, F_GETFL, 0);
-    if (flags == -1) return false;
-
-    return fcntl(fd, F_SETFL, flags | O_NONBLOCK) != -1;
-}
-
-
 static bool init_resource_types(ErlNifEnv* env, ErlNifResourceFlags flags)
 {
     ErlNifResourceTypeInit init;
     init.dtor = socket_dtor;
     init.stop = socket_stop;
-    init.down = NULL;
+    init.down = socket_down;
 
     socket_type = enif_open_resource_type_x(env, "socket", &init, flags, NULL);
     fd_type = enif_open_resource_type(env, NULL, "fd", fd_dtor, flags, NULL);
@@ -128,7 +147,24 @@ static void init_atoms(ErlNifEnv* env)
 
 static ERL_NIF_TERM alloc_socket(ErlNifEnv* env, int fd)
 {
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags == -1 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) == -1) {
+        int error = errno;
+        close(fd);
+        return errno_error(env, error);
+    }
+
+    ErlNifPid pid;
+    enif_self(env, &pid);
+
     socket_data *sd = enif_alloc_resource(socket_type,sizeof(socket_data));
+
+    if (enif_monitor_process(env, sd, &pid, NULL) != 0) {
+        enif_release_resource(sd);
+        close(fd);
+        return enif_make_badarg(env);
+    }
+
     sd->fd = fd;
     sd->unlink = false;
 
@@ -208,36 +244,11 @@ static bool unlink_sockpath(const char* path)
 }
 
 
-static ERL_NIF_TERM errno_error(ErlNifEnv* env, int error) {
-    ERL_NIF_TERM reason = enif_make_atom(env, erl_errno_id(error));
-
-    return enif_make_tuple2(env, atom_error, reason);
-}
-
-
-static ERL_NIF_TERM closed_error(ErlNifEnv* env) {
-    return enif_make_tuple2(env, atom_error, atom_closed);
-}
-
-
-static ERL_NIF_TERM errno_exception(ErlNifEnv* env, int error) {
-    ERL_NIF_TERM reason = enif_make_atom(env, erl_errno_id(errno));
-
-    return enif_raise_exception(env, reason);
-}
-
-
 static ERL_NIF_TERM
 socket_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
 {
     int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (fd < 0) return errno_exception(env, errno);
-
-    if (!make_fd_nonblock(fd)) {
-        int error = errno;
-        close(fd);
-        return errno_error(env, error);
-    }
 
     return alloc_socket(env, fd);
 }
@@ -306,13 +317,11 @@ accept_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
     int afd = accept(sd->fd, NULL, NULL);
     if (afd == -1) return errno_error(env, errno);
 
-    if (!make_fd_nonblock(afd)) {
-        int error = errno;
-        close(afd);
-        return errno_error(env, error);
-    }
-
     ERL_NIF_TERM socket = alloc_socket(env, afd);
+
+    ERL_NIF_TERM reason;
+    if (enif_has_pending_exception(env, &reason)) return reason;
+
     return enif_make_tuple2(env, atom_ok, socket);
 }
 
