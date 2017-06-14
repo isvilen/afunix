@@ -41,6 +41,45 @@ typedef struct {
 } socket_data;
 
 
+static bool init_sockaddr(socket_data* sd, ErlNifEnv* env, ERL_NIF_TERM arg,
+                          socklen_t* len)
+{
+    ErlNifBinary path;
+
+    if (!enif_inspect_binary(env, arg, &path)) return false;
+
+    struct sockaddr_un* addr = &sd->addr;
+
+    memset(addr, 0, sizeof *addr);
+    addr->sun_family = AF_UNIX;
+
+    if (path.size > sizeof(addr->sun_path)) return false;
+
+    memcpy(addr->sun_path, path.data, path.size);
+
+    *len = sizeof(sd->addr.sun_family) + path.size;
+
+    return true;
+}
+
+
+static bool unlink_sockpath(socket_data* sd)
+{
+    if (!sd->unlink) return true;
+
+    const char* path = sd->addr.sun_path;
+    if (path[0] == 0) return true;
+
+    struct stat sb;
+
+    if (stat(path, &sb) != 0) return errno == ENOENT;
+
+    if (S_ISREG(sb.st_mode) || S_ISDIR(sb.st_mode)) return false;
+
+    return unlink(path) == 0;
+}
+
+
 static ERL_NIF_TERM errno_error(ErlNifEnv* env, int error) {
     ERL_NIF_TERM reason = enif_make_atom(env, erl_errno_id(error));
 
@@ -100,7 +139,7 @@ static void socket_dtor(ErlNifEnv *env, void *obj)
         enif_fprintf(stderr, "afunix: close fd %d error %d", sd->fd, rc);
     }
 
-    if (sd->unlink) unlink(sd->addr.sun_path);
+    unlink_sockpath(sd);
 
     enif_mutex_destroy(sd->mtx);
 }
@@ -241,39 +280,6 @@ static bool get_fd(ErlNifEnv* env, ERL_NIF_TERM term, int* fd)
 }
 
 
-static bool get_path(ErlNifEnv* env, ERL_NIF_TERM term, ErlNifBinary* path)
-{
-    return enif_inspect_binary(env, term, path);
-}
-
-
-static bool init_sockaddr(socket_data* sd, ErlNifBinary path)
-{
-    struct sockaddr_un* addr = &sd->addr;
-
-    memset(addr, 0, sizeof *addr);
-    addr->sun_family = AF_UNIX;
-
-    if ((path.size + 1) > sizeof(addr->sun_path)) return false;
-
-    memcpy(addr->sun_path, path.data, path.size);
-
-    return true;
-}
-
-
-static bool unlink_sockpath(const char* path)
-{
-    struct stat sb;
-
-    if (stat(path, &sb) != 0) return errno == ENOENT;
-
-    if (S_ISREG(sb.st_mode) || S_ISDIR(sb.st_mode)) return false;
-
-    return unlink(path) == 0;
-}
-
-
 static ERL_NIF_TERM
 socket_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
 {
@@ -288,10 +294,8 @@ static ERL_NIF_TERM
 bind_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
 {
     socket_data* sd;
-    ErlNifBinary path;
 
-    if (!get_socket(env, argv[0], &sd) || !get_path(env, argv[1], &path))
-        return enif_make_badarg(env);
+    if (!get_socket(env, argv[0], &sd)) return enif_make_badarg(env);
 
     enif_mutex_lock(sd->mtx);
 
@@ -300,25 +304,24 @@ bind_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
         return closed_error(env);
     }
 
-    if (!init_sockaddr(sd, path)) {
+    socklen_t len;
+    if (!init_sockaddr(sd, env, argv[1], &len)) {
         enif_mutex_unlock(sd->mtx);
         return enif_make_badarg(env);
     }
 
     if (enif_is_identical(argv[2], atom_true)) {
-        if (!unlink_sockpath(sd->addr.sun_path)) {
+        sd->unlink = true;
+
+        if (!unlink_sockpath(sd)) {
             enif_mutex_unlock(sd->mtx);
             return enif_make_badarg(env);
         }
-
-        sd->unlink = true;
 
     } else if (!enif_is_identical(argv[2], atom_false)) {
         enif_mutex_unlock(sd->mtx);
         return enif_make_badarg(env);
     }
-
-    socklen_t len = sizeof(sd->addr.sun_family) + strlen(sd->addr.sun_path);
 
     if (bind(sd->fd, (struct sockaddr *)&sd->addr, len) == -1) {
         int err = errno;
@@ -397,10 +400,8 @@ static ERL_NIF_TERM
 connect_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
 {
     socket_data *sd;
-    ErlNifBinary path;
 
-    if (!get_socket(env, argv[0], &sd) || !get_path(env, argv[1], &path))
-        return enif_make_badarg(env);
+    if (!get_socket(env, argv[0], &sd)) return enif_make_badarg(env);
 
     enif_mutex_lock(sd->mtx);
 
@@ -409,12 +410,11 @@ connect_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
         return closed_error(env);
     }
 
-    if (!init_sockaddr(sd, path)) {
+    socklen_t len;
+    if (!init_sockaddr(sd, env, argv[1], &len)) {
         enif_mutex_unlock(sd->mtx);
         return enif_make_badarg(env);
     }
-
-    socklen_t len = sizeof(sd->addr.sun_family) + strlen(sd->addr.sun_path);
 
     if (connect(sd->fd, (struct sockaddr *)&sd->addr, len) == -1) {
         int err = errno;
