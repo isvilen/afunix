@@ -1,6 +1,7 @@
 -module(afunix).
 
 -export([ socket/0
+        , socket/1
         , bind/2
         , bind/3
         , listen/1
@@ -23,7 +24,11 @@
 
 
 socket() ->
-    erlang:nif_error(not_loaded).
+    socket(stream).
+
+
+socket(Type) ->
+    erlang:nif_error(not_loaded, [Type]).
 
 
 bind(Socket, Path) ->

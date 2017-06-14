@@ -31,6 +31,8 @@ static ERL_NIF_TERM atom_sndbuf;
 static ERL_NIF_TERM atom_input;
 static ERL_NIF_TERM atom_output;
 static ERL_NIF_TERM atom_undefined;
+static ERL_NIF_TERM atom_stream;
+static ERL_NIF_TERM atom_datagram;
 
 
 typedef struct {
@@ -203,6 +205,8 @@ static void init_atoms(ErlNifEnv* env)
     atom_input = enif_make_atom(env, "input");
     atom_output = enif_make_atom(env, "output");
     atom_undefined = enif_make_atom(env, "undefined");
+    atom_stream = enif_make_atom(env, "stream");
+    atom_datagram = enif_make_atom(env, "datagram");
 }
 
 
@@ -283,7 +287,15 @@ static bool get_fd(ErlNifEnv* env, ERL_NIF_TERM term, int* fd)
 static ERL_NIF_TERM
 socket_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
 {
-    int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    int type;
+    if (enif_is_identical(argv[0], atom_stream))
+        type = SOCK_STREAM;
+    else if (enif_is_identical(argv[0], atom_datagram))
+        type = SOCK_DGRAM;
+    else
+       return enif_make_badarg(env);
+
+    int fd = socket(AF_UNIX,  type | SOCK_CLOEXEC, 0);
     if (fd < 0) return errno_exception(env, errno);
 
     return alloc_socket(env, fd);
@@ -853,7 +865,7 @@ static int upgrade(ErlNifEnv* env, void** priv_data, void** old_priv_data,
 
 static ErlNifFunc nifs[] =
 {
-    {"socket",        0, socket_nif},
+    {"socket",        1, socket_nif},
     {"bind",          3, bind_nif},
     {"listen",        2, listen_nif},
     {"accept",        1, accept_nif},
