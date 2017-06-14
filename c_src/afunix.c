@@ -446,7 +446,7 @@ send_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
     ErlNifBinary bin;
 
     if (!get_socket(env, argv[0], &sd) ||
-        !enif_inspect_binary(env, argv[1], &bin) ||
+        !enif_inspect_iolist_as_binary(env, argv[1], &bin) ||
         bin.size == 0)
         return enif_make_badarg(env);
 
@@ -494,9 +494,9 @@ send_fd_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
     ErlNifBinary bin;
 
     if (!get_socket(env, argv[0], &sd) ||
-        !enif_get_list_length(env, argv[1], &num_fd) ||
+        !enif_inspect_iolist_as_binary(env, argv[1], &bin) ||
+        !enif_get_list_length(env, argv[2], &num_fd) ||
         num_fd > MAX_FDS ||
-        !enif_inspect_binary(env, argv[2], &bin) ||
         bin.size == 0)
         return enif_make_badarg(env);
 
@@ -512,7 +512,7 @@ send_fd_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
     struct cmsghdr *cmsg;
     int fds[num_fd];
 
-    ERL_NIF_TERM fd_list = argv[1];
+    ERL_NIF_TERM fd_list = argv[2];
     ERL_NIF_TERM fd_cell;
     int fd;
     unsigned fd_idx = 0;
@@ -649,7 +649,7 @@ recv_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
     ERL_NIF_TERM recv_data = enif_make_binary(env, &buf);
 
     if (fd_cnt > 0)
-        return enif_make_tuple3(env, atom_ok, fd_list, recv_data);
+        return enif_make_tuple3(env, atom_ok, recv_data, fd_list);
 
     return enif_make_tuple2(env, atom_ok, recv_data);
 }
@@ -711,18 +711,22 @@ getsockopt_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
 
     enif_mutex_unlock(sd->mtx);
 
+    ERL_NIF_TERM result;
     if (enif_is_identical(argv[1], atom_error)) {
-        return iopt == 0 ? atom_noerror
-                         : enif_make_atom(env, erl_errno_id(iopt));
+        result = iopt == 0 ? atom_noerror
+                           : enif_make_atom(env, erl_errno_id(iopt));
 
     } else if (enif_is_identical(argv[1], atom_recbuf)) {
-        return enif_make_uint(env, sopt);
+        result = enif_make_uint(env, sopt);
 
     } else if (enif_is_identical(argv[1], atom_sndbuf)) {
-        return enif_make_uint(env, sopt);
+        result = enif_make_uint(env, sopt);
+
+    } else {
+        return enif_make_badarg(env);
     }
 
-    return enif_make_badarg(env);
+    return enif_make_tuple2(env, atom_ok, result);
 }
 
 
