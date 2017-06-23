@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/socket.h>
@@ -8,6 +9,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stdbool.h>
+#include <stdio.h>
 #include <string.h>
 
 #include <erl_nif.h>
@@ -16,518 +18,60 @@
 
 #define MAX_FDS 28
 
-
-typedef struct monitor_data
-{
-    struct monitor_data* next;
-    int socket;
-    enum { MONITOR_NONE // socket is garbage collected, do not send notification
-         , MONITOR_READ // send notification when socket is readable
-         , MONITOR_WRITE // send notification when socket is writable
-         , MONITOR_CLOSED // close is called, send notification and expect
-                          // next API call to fail with {error, closed}
-         } event;
-
-    ErlNifEnv *env;
-    ErlNifPid pid;
-    ERL_NIF_TERM msg;
-
-} monitor_data;
+static ErlNifResourceType* socket_type;
+static ErlNifResourceType* fd_type;
+static ERL_NIF_TERM atom_ok;
+static ERL_NIF_TERM atom_error;
+static ERL_NIF_TERM atom_closed;
+static ERL_NIF_TERM atom_true;
+static ERL_NIF_TERM atom_false;
+static ERL_NIF_TERM atom_noerror;
+static ERL_NIF_TERM atom_recbuf;
+static ERL_NIF_TERM atom_sndbuf;
+static ERL_NIF_TERM atom_input;
+static ERL_NIF_TERM atom_output;
+static ERL_NIF_TERM atom_undefined;
+static ERL_NIF_TERM atom_stream;
+static ERL_NIF_TERM atom_datagram;
 
 
 typedef struct {
-    ErlNifResourceType* socket_type;
-    ErlNifResourceType* fd_type;
-    ERL_NIF_TERM atom_ok;
-    ERL_NIF_TERM atom_error;
-    ERL_NIF_TERM atom_closed;
-    ERL_NIF_TERM atom_true;
-    ERL_NIF_TERM atom_false;
-    ERL_NIF_TERM atom_noerror;
-    ERL_NIF_TERM atom_recbuf;
-    ERL_NIF_TERM atom_sndbuf;
-    ERL_NIF_TERM atom_afunix;
-    ERL_NIF_TERM atom_read;
-    ERL_NIF_TERM atom_write;
-
-    int pipefd[2];
-    ErlNifMutex *lock;
-    ErlNifCond *cond;
-
-    ErlNifTid tid;
-    bool running;
-
-    monitor_data* monitors;
-
-} afunix_data;
-
-
-typedef struct {
+    ErlNifMutex* mtx;
     int fd;
     struct sockaddr_un addr;
     bool unlink;
 } socket_data;
 
 
-typedef struct {
-    int nfds;
-    int pipefd;
-    fd_set rfds, wfds;
-} select_data;
-
-
-static afunix_data* priv_data(ErlNifEnv* env)
+static bool init_sockaddr(socket_data* sd, ErlNifEnv* env, ERL_NIF_TERM arg,
+                          socklen_t* len)
 {
-    return (afunix_data *) enif_priv_data(env);
-}
+    ErlNifBinary path;
 
+    if (!enif_inspect_binary(env, arg, &path)) return false;
 
-// lock must be held
-static void wakeup_select_thread(afunix_data* data)
-{
-    char buf = 0;
-    write(data->pipefd[1], &buf, 1);
-}
-
-
-static void cancel_monitors(ErlNifEnv *env, socket_data *sd, bool notify)
-{
-    afunix_data* data = priv_data(env);
-
-    enif_mutex_lock(data->lock);
-
-    bool has_monitors = false;
-
-    monitor_data* mon = data->monitors;
-    while (mon != NULL) {
-        if (mon->socket == sd->fd) {
-            has_monitors = true;
-            mon->event = notify ? MONITOR_CLOSED : MONITOR_NONE;
-        }
-
-        mon = mon->next;
-    }
-
-    while (has_monitors) {
-        wakeup_select_thread(data);
-        enif_cond_wait(data->cond, data->lock);
-
-        has_monitors = false;
-        mon = data->monitors;
-        while (mon != NULL) {
-            if (mon->socket == sd->fd) {
-                has_monitors = true;
-                break;
-            }
-            mon = mon->next;
-        }
-    }
-
-    enif_mutex_unlock(data->lock);
-}
-
-
-static void socket_dtor(ErlNifEnv *env, void *obj)
-{
-    socket_data *sd = (socket_data *) obj;
-
-    if (sd->fd == -1) return;
-
-    cancel_monitors(env, sd, false);
-
-    close(sd->fd);
-
-    if (sd->unlink) unlink(sd->addr.sun_path);
-}
-
-
-static void fd_dtor(ErlNifEnv *env, void *obj)
-{
-    int *fd = (int *) obj;
-
-    if (*fd != -1) close(*fd);
-}
-
-
-static bool make_fd_nonblock(int fd)
-{
-    int flags = fcntl(fd, F_GETFL, 0);
-    if (flags == -1) return false;
-
-    return fcntl(fd, F_SETFL, flags | O_NONBLOCK) != -1;
-}
-
-
-static afunix_data* init_priv_data(ErlNifEnv* env, ErlNifResourceFlags flags)
-{
-    ErlNifResourceType *socket_type, *fd_type;
-    int error;
-
-    socket_type = enif_open_resource_type(env, NULL, "socket", socket_dtor,
-                                          flags, NULL);
-
-    fd_type = enif_open_resource_type(env, NULL, "fd", fd_dtor, flags, NULL);
-
-    if (!socket_type || !fd_type) return NULL;
-
-    afunix_data *data = (afunix_data *) enif_alloc(sizeof(afunix_data));
-
-    data->socket_type = socket_type;
-    data->fd_type = fd_type;
-
-    data->atom_ok = enif_make_atom(env, "ok");
-    data->atom_error = enif_make_atom(env, "error");
-    data->atom_closed = enif_make_atom(env, "closed");
-    data->atom_true = enif_make_atom(env, "true");
-    data->atom_false = enif_make_atom(env, "false");
-    data->atom_recbuf = enif_make_atom(env, "recbuf");
-    data->atom_sndbuf = enif_make_atom(env, "sndbuf");
-    data->atom_noerror = enif_make_atom(env, "noerror");
-    data->atom_afunix = enif_make_atom(env, "afunix");
-    data->atom_read = enif_make_atom(env, "read");
-    data->atom_write = enif_make_atom(env, "write");
-
-    data->pipefd[0] = -1;
-    data->pipefd[1] = -1;
-    data->lock = NULL;
-    data->cond = NULL;
-    data->running = false;
-    data->monitors = NULL;
-
-    if (pipe(data->pipefd) != 0) goto ERROR;
-
-    if (!make_fd_nonblock(data->pipefd[0]) ||
-        !make_fd_nonblock(data->pipefd[1]))
-        goto ERROR;
-
-    data->lock = enif_mutex_create("afunix");
-    if (data->lock == NULL) goto ERROR;
-
-    data->cond = enif_cond_create("afunix");
-    if (data->cond == NULL) goto ERROR;
-
-    return data;
-
-ERROR:
-        error = errno;
-
-        if (data->pipefd[0] != -1) close(data->pipefd[0]);
-        if (data->pipefd[1] != -1) close(data->pipefd[1]);
-
-        if (data->cond != NULL) enif_cond_destroy(data->cond);
-        if (data->lock != NULL) enif_mutex_destroy(data->lock);
-
-        enif_free(data);
-
-        errno = error;
-
-        return NULL;
-}
-
-
-static void upgrade_priv_data(afunix_data *old_data, afunix_data* new_data)
-{
-    enif_mutex_lock(old_data->lock);
-    enif_mutex_lock(new_data->lock);
-
-
-    enif_mutex_unlock(new_data->lock);
-    enif_mutex_unlock(old_data->lock);
-}
-
-
-static void free_priv_data(afunix_data* data)
-{
-    close(data->pipefd[0]);
-    close(data->pipefd[1]);
-
-    enif_cond_destroy(data->cond);
-    enif_mutex_destroy(data->lock);
-
-    enif_free(data);
-}
-
-
-static monitor_data*
-init_monitor_data(ErlNifEnv* env, socket_data* sd, int event, ERL_NIF_TERM ref)
-{
-    monitor_data* mon = enif_alloc(sizeof(monitor_data));
-
-    if (mon != NULL) {
-        mon->env = enif_alloc_env();
-        if (mon->env == NULL) {
-            enif_free(mon);
-            return NULL;
-        }
-
-        mon->next = NULL;
-        mon->socket = sd->fd;
-        mon->event = event;
-
-        ERL_NIF_TERM mon_afunix, mon_ref;
-
-        afunix_data *data = priv_data(env);
-
-        mon_afunix = enif_make_copy(mon->env, data->atom_afunix);
-        mon_ref = enif_make_copy(mon->env, ref);
-
-        mon->msg = enif_make_tuple2(mon->env, mon_afunix, mon_ref);
-
-        enif_self(env, &mon->pid);
-    }
-
-    return mon;
-}
-
-
-static void free_monitor_data(monitor_data* mon)
-{
-    enif_free_env(mon->env);
-    enif_free(mon);
-}
-
-
-static void init_select(select_data* sdata, afunix_data* adata)
-{
-    enif_mutex_lock(adata->lock);
-
-    sdata->pipefd = adata->pipefd[0];
-    sdata->nfds = sdata->pipefd + 1;
-
-    enif_mutex_unlock(adata->lock);
-
-    FD_ZERO(&sdata->rfds);
-    FD_SET(sdata->pipefd, &sdata->rfds);
-
-    FD_ZERO(&sdata->wfds);
-}
-
-
-static void drain_wakeup_pipe(select_data* data)
-{
-    if (FD_ISSET(data->pipefd, &data->rfds)) {
-        char buf;
-        int rc;
-        do {
-            rc = read(data->pipefd, &buf, 1);
-        } while(rc == 1 || (rc == -1 && errno == EINTR));
-    }
-}
-
-
-static void send_notifications(select_data* sdata, afunix_data* adata)
-{
-    enif_mutex_lock(adata->lock);
-
-    monitor_data** monptr = &adata->monitors;
-
-    while (*monptr != NULL) {
-        monitor_data* mon = *monptr;
-
-        if (FD_ISSET(mon->socket, &sdata->rfds) ||
-            FD_ISSET(mon->socket, &sdata->wfds)) {
-
-            if (mon->event != MONITOR_NONE)
-                enif_send(NULL, &mon->pid, mon->env, mon->msg);
-
-            monitor_data* next = mon->next;
-            free_monitor_data(mon);
-            *monptr = next;
-
-        } else {
-            monptr = &(mon->next);
-        }
-    }
-
-    enif_mutex_unlock(adata->lock);
-}
-
-
-static bool update_select(select_data* sdata, afunix_data* adata)
-{
-    enif_mutex_lock(adata->lock);
-
-    if (!adata->running) {
-        enif_mutex_unlock(adata->lock);
-        return false;
-    }
-
-    FD_ZERO(&sdata->rfds);
-    FD_SET(sdata->pipefd, &sdata->rfds);
-
-    FD_ZERO(&sdata->wfds);
-
-    sdata->nfds = sdata->pipefd;
-
-    monitor_data** monptr = &adata->monitors;
-    bool monitors_freed = false;
-
-    while (*monptr != NULL) {
-        monitor_data* mon = *monptr;
-
-        switch (mon->event) {
-        case MONITOR_READ:
-            FD_SET(mon->socket, &sdata->rfds);
-            break;
-        case MONITOR_WRITE:
-            FD_SET(mon->socket, &sdata->wfds);
-            break;
-        case MONITOR_CLOSED:
-            enif_send(NULL, &mon->pid, mon->env, mon->msg);
-            // fall-through to delete monitor data
-        case MONITOR_NONE: { // socket destructor waiting
-            monitors_freed = true;
-            monitor_data* next = mon->next;
-            free_monitor_data(mon);
-            *monptr = next;
-            continue;
-        }
-        }
-
-        if (mon->socket > sdata->nfds) sdata->nfds = mon->socket;
-
-        monptr = &(mon->next);
-    }
-
-    if (monitors_freed) enif_cond_broadcast(adata->cond);
-
-    enif_mutex_unlock(adata->lock);
-
-    sdata->nfds += 1;
-
-    return true;
-}
-
-
-static void* select_thread(void* arg)
-{
-    select_data data;
-    init_select(&data, (afunix_data*) arg);
-
-    do {
-        int rc = select(data.nfds, &data.rfds, &data.wfds, NULL, NULL);
-        if (rc == -1 && errno == EINTR) continue;
-
-        assert(rc != -1);
-
-        drain_wakeup_pipe(&data);
-        send_notifications(&data, (afunix_data*) arg);
-
-    } while (update_select(&data, (afunix_data*) arg));
-
-    return NULL;
-}
-
-
-static bool start_select_thread(afunix_data* data)
-{
-    enif_mutex_lock(data->lock);
-
-    if (enif_thread_create("afunix", &data->tid, select_thread, data, 0) != 0) {
-        enif_mutex_unlock(data->lock);
-        return false;
-    }
-
-    data->running = true;
-    enif_mutex_unlock(data->lock);
-
-    return true;
-}
-
-
-static void stop_select_thread(afunix_data* data)
-{
-    enif_mutex_lock(data->lock);
-
-    assert(data->running);
-
-    data->running = false;
-
-    wakeup_select_thread(data);
-
-    enif_mutex_unlock(data->lock);
-
-    enif_thread_join(data->tid, NULL);
-}
-
-
-static ERL_NIF_TERM alloc_socket(ErlNifEnv* env, int fd)
-{
-    afunix_data *data = priv_data(env);
-
-    socket_data *sd = enif_alloc_resource(data->socket_type,sizeof(socket_data));
-    sd->fd = fd;
-    sd->unlink = false;
-
-    ERL_NIF_TERM socket = enif_make_resource(env, sd);
-
-    enif_release_resource(sd);
-
-    return socket;
-}
-
-
-static bool get_socket(ErlNifEnv* env, ERL_NIF_TERM term, socket_data** sdptr)
-{
-    afunix_data *data = priv_data(env);
-
-    void *res;
-    if (!enif_get_resource(env, term, data->socket_type, &res)) return false;
-
-    *sdptr = (socket_data *)res;
-
-    return true;
-}
-
-
-static ERL_NIF_TERM alloc_fd(ErlNifEnv* env, int fd)
-{
-    int *res = enif_alloc_resource(priv_data(env)->fd_type, sizeof(int));
-    *res = fd;
-
-    ERL_NIF_TERM fd_term = enif_make_resource(env, res);
-    enif_release_resource(res);
-
-    return fd_term;
-}
-
-
-static bool get_fd(ErlNifEnv* env, ERL_NIF_TERM term, int** fd)
-{
-    afunix_data *data = priv_data(env);
-
-    void *res;
-    if (!enif_get_resource(env, term, data->fd_type, &res)) return false;
-
-    *fd = (int *)res;
-
-    return true;
-}
-
-
-static bool get_path(ErlNifEnv* env, ERL_NIF_TERM term, ErlNifBinary* path)
-{
-    return enif_inspect_binary(env, term, path);
-}
-
-
-static bool init_sockaddr(socket_data* sd, ErlNifBinary path)
-{
     struct sockaddr_un* addr = &sd->addr;
 
     memset(addr, 0, sizeof *addr);
     addr->sun_family = AF_UNIX;
 
-    if ((path.size + 1) > sizeof(addr->sun_path)) return false;
+    if (path.size > sizeof(addr->sun_path)) return false;
 
     memcpy(addr->sun_path, path.data, path.size);
+
+    *len = sizeof(sd->addr.sun_family) + path.size;
 
     return true;
 }
 
 
-static bool unlink_sockpath(const char* path)
+static bool unlink_sockpath(socket_data* sd)
 {
+    if (!sd->unlink) return true;
+
+    const char* path = sd->addr.sun_path;
+    if (path[0] == 0) return true;
+
     struct stat sb;
 
     if (stat(path, &sb) != 0) return errno == ENOENT;
@@ -541,14 +85,12 @@ static bool unlink_sockpath(const char* path)
 static ERL_NIF_TERM errno_error(ErlNifEnv* env, int error) {
     ERL_NIF_TERM reason = enif_make_atom(env, erl_errno_id(error));
 
-    return enif_make_tuple2(env, priv_data(env)->atom_error, reason);
+    return enif_make_tuple2(env, atom_error, reason);
 }
 
 
 static ERL_NIF_TERM closed_error(ErlNifEnv* env) {
-    afunix_data* data = priv_data(env);
-
-    return enif_make_tuple2(env, data->atom_error, data->atom_closed);
+    return enif_make_tuple2(env, atom_error, atom_closed);
 }
 
 
@@ -559,17 +101,202 @@ static ERL_NIF_TERM errno_exception(ErlNifEnv* env, int error) {
 }
 
 
-static ERL_NIF_TERM
-socket_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
+static int close_socket(ErlNifEnv *env, socket_data *sd)
 {
-    int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
-    if (fd < 0) return errno_exception(env, errno);
+    enif_mutex_lock(sd->mtx);
 
-    if (!make_fd_nonblock(fd)) {
+    if (sd->fd == -1) {
+        enif_mutex_unlock(sd->mtx);
+        return 0;
+    }
+
+    int rc = enif_select(env, sd->fd, ERL_NIF_SELECT_STOP, sd, NULL,
+                         atom_undefined);
+
+    if (rc > 0 && ((rc & ERL_NIF_SELECT_STOP_CALLED)
+                   || (rc & ERL_NIF_SELECT_STOP_SCHEDULED))) {
+        sd->fd = -1;
+        enif_mutex_unlock(sd->mtx);
+        return 0;
+    }
+
+    rc = 0;
+
+    if (close(sd->fd) != 0) rc = errno;
+
+    sd->fd = -1;
+
+    enif_mutex_unlock(sd->mtx);
+
+    return rc;
+}
+
+
+static void socket_dtor(ErlNifEnv *env, void *obj)
+{
+    socket_data *sd = (socket_data *) obj;
+
+    int rc = close_socket(env, sd);
+    if (rc != 0) {
+        enif_fprintf(stderr, "afunix: close fd %d error %d", sd->fd, rc);
+    }
+
+    unlink_sockpath(sd);
+
+    enif_mutex_destroy(sd->mtx);
+}
+
+
+static void socket_stop(ErlNifEnv* env, void* obj, ErlNifEvent event,
+                        int is_direct_call)
+{
+    if (close(event) != 0) {
+        enif_fprintf(stderr, "afunix: close fd %d error %d", event, errno);
+    }
+}
+
+
+static void socket_down(ErlNifEnv* env, void* obj, ErlNifPid* pid,
+                        ErlNifMonitor* mon)
+{
+    socket_data *sd = (socket_data *) obj;
+
+    int rc = close_socket(env, sd);
+    if (rc != 0) {
+        enif_fprintf(stderr, "afunix: close fd %d error %d", sd->fd, rc);
+    }
+}
+
+
+static void fd_dtor(ErlNifEnv *env, void *obj)
+{
+    int *fd = (int *) obj;
+
+    if (close(*fd) != 0) {
+        enif_fprintf(stderr, "afunix: close fd %d error %d", *fd, errno);
+    }
+}
+
+
+static bool init_resource_types(ErlNifEnv* env, ErlNifResourceFlags flags)
+{
+    ErlNifResourceTypeInit init;
+    init.dtor = socket_dtor;
+    init.stop = socket_stop;
+    init.down = socket_down;
+
+    socket_type = enif_open_resource_type_x(env, "socket", &init, flags, NULL);
+    fd_type = enif_open_resource_type(env, NULL, "fd", fd_dtor, flags, NULL);
+
+    return socket_type && fd_type;
+}
+
+
+static void init_atoms(ErlNifEnv* env)
+{
+    atom_ok = enif_make_atom(env, "ok");
+    atom_error = enif_make_atom(env, "error");
+    atom_closed = enif_make_atom(env, "closed");
+    atom_true = enif_make_atom(env, "true");
+    atom_false = enif_make_atom(env, "false");
+    atom_recbuf = enif_make_atom(env, "recbuf");
+    atom_sndbuf = enif_make_atom(env, "sndbuf");
+    atom_noerror = enif_make_atom(env, "noerror");
+    atom_input = enif_make_atom(env, "input");
+    atom_output = enif_make_atom(env, "output");
+    atom_undefined = enif_make_atom(env, "undefined");
+    atom_stream = enif_make_atom(env, "stream");
+    atom_datagram = enif_make_atom(env, "datagram");
+}
+
+
+static ERL_NIF_TERM alloc_socket(ErlNifEnv* env, int fd)
+{
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags == -1 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) == -1) {
         int error = errno;
         close(fd);
         return errno_error(env, error);
     }
+
+    ErlNifPid pid;
+    enif_self(env, &pid);
+
+    socket_data *sd = enif_alloc_resource(socket_type,sizeof(socket_data));
+
+    sd->mtx = enif_mutex_create("afunix_socket");
+    if (sd->mtx == NULL) {
+        enif_release_resource(sd);
+        close(fd);
+        return errno_error(env, ENOLCK);
+    }
+
+    if (enif_monitor_process(env, sd, &pid, NULL) != 0) {
+        enif_mutex_destroy(sd->mtx);
+        enif_release_resource(sd);
+        close(fd);
+        return enif_make_badarg(env);
+    }
+
+    sd->fd = fd;
+    sd->unlink = false;
+
+    ERL_NIF_TERM socket = enif_make_resource(env, sd);
+
+    enif_release_resource(sd);
+
+    return socket;
+}
+
+
+static bool get_socket(ErlNifEnv* env, ERL_NIF_TERM term, socket_data** sdptr)
+{
+    void *res;
+    if (!enif_get_resource(env, term, socket_type, &res)) return false;
+
+    *sdptr = (socket_data *)res;
+
+    return true;
+}
+
+
+static ERL_NIF_TERM alloc_fd(ErlNifEnv* env, int fd)
+{
+    int *res = enif_alloc_resource(fd_type, sizeof(int));
+    *res = fd;
+
+    ERL_NIF_TERM fd_term = enif_make_resource_binary(env, res, res, sizeof(int));
+    enif_release_resource(res);
+
+    return fd_term;
+}
+
+
+static bool get_fd(ErlNifEnv* env, ERL_NIF_TERM term, int* fd)
+{
+    ErlNifBinary bin;
+    if (!enif_inspect_binary(env, term, &bin) || bin.size != sizeof(int))
+        return false;
+
+    *fd = *(int* )bin.data;
+
+    return fcntl(*fd, F_GETFD) != -1;
+}
+
+
+static ERL_NIF_TERM
+socket_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
+{
+    int type;
+    if (enif_is_identical(argv[0], atom_stream))
+        type = SOCK_STREAM;
+    else if (enif_is_identical(argv[0], atom_datagram))
+        type = SOCK_DGRAM;
+    else
+       return enif_make_badarg(env);
+
+    int fd = socket(AF_UNIX,  type | SOCK_CLOEXEC, 0);
+    if (fd < 0) return errno_exception(env, errno);
 
     return alloc_socket(env, fd);
 }
@@ -578,36 +305,45 @@ socket_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
 static ERL_NIF_TERM
 bind_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
 {
-    afunix_data *data = (afunix_data *) enif_priv_data(env);
-
     socket_data* sd;
-    ErlNifBinary path;
 
-    if (!get_socket(env, argv[0], &sd) || !get_path(env, argv[1], &path))
+    if (!get_socket(env, argv[0], &sd)) return enif_make_badarg(env);
+
+    enif_mutex_lock(sd->mtx);
+
+    if (sd->fd == -1) {
+        enif_mutex_unlock(sd->mtx);
+        return closed_error(env);
+    }
+
+    socklen_t len;
+    if (!init_sockaddr(sd, env, argv[1], &len)) {
+        enif_mutex_unlock(sd->mtx);
         return enif_make_badarg(env);
+    }
 
-    if (sd->fd == -1) return closed_error(env);
-
-    if (!init_sockaddr(sd, path)) return enif_make_badarg(env);
-
-    if (enif_is_identical(argv[2], data->atom_true)) {
-        if (!unlink_sockpath(sd->addr.sun_path))
-            return enif_make_badarg(env);
-
+    if (enif_is_identical(argv[2], atom_true)) {
         sd->unlink = true;
 
-    } else if (!enif_is_identical(argv[2], data->atom_false)) {
+        if (!unlink_sockpath(sd)) {
+            enif_mutex_unlock(sd->mtx);
+            return enif_make_badarg(env);
+        }
+
+    } else if (!enif_is_identical(argv[2], atom_false)) {
+        enif_mutex_unlock(sd->mtx);
         return enif_make_badarg(env);
     }
 
-    socklen_t len = sizeof(sd->addr.sun_family) + strlen(sd->addr.sun_path);
-
     if (bind(sd->fd, (struct sockaddr *)&sd->addr, len) == -1) {
+        int err = errno;
         sd->unlink = false;
-        return errno_error(env, errno);
+        enif_mutex_unlock(sd->mtx);
+        return errno_error(env, err);
     }
 
-    return data->atom_ok;
+    enif_mutex_unlock(sd->mtx);
+    return atom_ok;
 }
 
 
@@ -620,11 +356,21 @@ listen_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
     if (!get_socket(env, argv[0], &sd) || !enif_get_int(env, argv[1], &backlog))
         return enif_make_badarg(env);
 
-    if (sd->fd == -1) return closed_error(env);
+    enif_mutex_lock(sd->mtx);
 
-    if (listen(sd->fd, backlog) == -1) return errno_error(env, errno);
+    if (sd->fd == -1) {
+        enif_mutex_unlock(sd->mtx);
+        return closed_error(env);
+    }
 
-    return priv_data(env)->atom_ok;
+    if (listen(sd->fd, backlog) == -1) {
+        int err = errno;
+        enif_mutex_unlock(sd->mtx);
+        return errno_error(env, err);
+    }
+
+    enif_mutex_unlock(sd->mtx);
+    return atom_ok;
 }
 
 
@@ -635,19 +381,30 @@ accept_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
 
     if (!get_socket(env, argv[0], &sd)) return enif_make_badarg(env);
 
-    if (sd->fd == -1) return closed_error(env);
+    enif_mutex_lock(sd->mtx);
+
+    if (sd->fd == -1) {
+        enif_mutex_unlock(sd->mtx);
+        return closed_error(env);
+    }
 
     int afd = accept(sd->fd, NULL, NULL);
-    if (afd == -1) return errno_error(env, errno);
-
-    if (!make_fd_nonblock(afd)) {
-        int error = errno;
-        close(afd);
-        return errno_error(env, error);
+    if (afd == -1) {
+        int err = errno;
+        enif_mutex_unlock(sd->mtx);
+        return errno_error(env, err);
     }
 
     ERL_NIF_TERM socket = alloc_socket(env, afd);
-    return enif_make_tuple2(env, priv_data(env)->atom_ok, socket);
+
+    ERL_NIF_TERM reason;
+    if (enif_has_pending_exception(env, &reason)) {
+        enif_mutex_unlock(sd->mtx);
+        return reason;
+    }
+
+    enif_mutex_unlock(sd->mtx);
+    return enif_make_tuple2(env, atom_ok, socket);
 }
 
 
@@ -655,21 +412,30 @@ static ERL_NIF_TERM
 connect_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
 {
     socket_data *sd;
-    ErlNifBinary path;
 
-    if (!get_socket(env, argv[0], &sd) || !get_path(env, argv[1], &path))
+    if (!get_socket(env, argv[0], &sd)) return enif_make_badarg(env);
+
+    enif_mutex_lock(sd->mtx);
+
+    if (sd->fd == -1) {
+        enif_mutex_unlock(sd->mtx);
+        return closed_error(env);
+    }
+
+    socklen_t len;
+    if (!init_sockaddr(sd, env, argv[1], &len)) {
+        enif_mutex_unlock(sd->mtx);
         return enif_make_badarg(env);
+    }
 
-    if (sd->fd == -1) return closed_error(env);
+    if (connect(sd->fd, (struct sockaddr *)&sd->addr, len) == -1) {
+        int err = errno;
+        enif_mutex_unlock(sd->mtx);
+        return errno_error(env, err);
+    }
 
-    if (!init_sockaddr(sd, path)) return enif_make_badarg(env);
-
-    socklen_t len = sizeof(sd->addr.sun_family) + strlen(sd->addr.sun_path);
-
-    if (connect(sd->fd, (struct sockaddr *)&sd->addr, len) == -1)
-        return errno_error(env, errno);
-
-    return priv_data(env)->atom_ok;
+    enif_mutex_unlock(sd->mtx);
+    return atom_ok;
 }
 
 
@@ -680,11 +446,16 @@ send_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
     ErlNifBinary bin;
 
     if (!get_socket(env, argv[0], &sd) ||
-        !enif_inspect_binary(env, argv[1], &bin) ||
+        !enif_inspect_iolist_as_binary(env, argv[1], &bin) ||
         bin.size == 0)
         return enif_make_badarg(env);
 
-    if (sd->fd == -1) return closed_error(env);
+    enif_mutex_lock(sd->mtx);
+
+    if (sd->fd == -1) {
+        enif_mutex_unlock(sd->mtx);
+        return closed_error(env);
+    }
 
     struct iovec iov[1];
     iov[0].iov_base = bin.data;
@@ -699,15 +470,19 @@ send_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
         len = sendmsg(sd->fd, &msg, MSG_NOSIGNAL);
     } while (len < 0 && errno == EINTR);
 
-    if (len < 0)
-        return errno_error(env, errno);
+    int err = errno;
 
-    afunix_data *data = priv_data(env);
+    enif_mutex_unlock(sd->mtx);
 
-    if (len < bin.size)
-        return enif_make_tuple2(env, data->atom_ok, enif_make_uint(env, len));
+    if (len < 0) {
+        return errno_error(env, err);
+    }
 
-    return data->atom_ok;
+    if (len < bin.size) {
+        return enif_make_tuple2(env, atom_ok, enif_make_uint(env, len));
+    }
+
+    return atom_ok;
 }
 
 
@@ -719,29 +494,36 @@ send_fd_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
     ErlNifBinary bin;
 
     if (!get_socket(env, argv[0], &sd) ||
-        !enif_get_list_length(env, argv[1], &num_fd) ||
+        !enif_inspect_iolist_as_binary(env, argv[1], &bin) ||
+        !enif_get_list_length(env, argv[2], &num_fd) ||
         num_fd > MAX_FDS ||
-        !enif_inspect_binary(env, argv[2], &bin) ||
         bin.size == 0)
         return enif_make_badarg(env);
 
-    if (sd->fd == -1) return closed_error(env);
+    enif_mutex_lock(sd->mtx);
+
+    if (sd->fd == -1) {
+        enif_mutex_unlock(sd->mtx);
+        return closed_error(env);
+    }
 
     struct msghdr msg = {0};
 
     struct cmsghdr *cmsg;
     int fds[num_fd];
 
-    ERL_NIF_TERM fd_list = argv[1];
+    ERL_NIF_TERM fd_list = argv[2];
     ERL_NIF_TERM fd_cell;
-    int *fdptr;
+    int fd;
     unsigned fd_idx = 0;
 
     while (enif_get_list_cell(env, fd_list, &fd_cell, &fd_list)) {
-        if (!get_fd(env, fd_cell, &fdptr) || *fdptr == -1)
+        if (!get_fd(env, fd_cell, &fd)) {
+            enif_mutex_unlock(sd->mtx);
             return enif_make_badarg(env);
+        }
 
-        fds[fd_idx++] = *fdptr;
+        fds[fd_idx++] = fd;
     }
 
     union {
@@ -756,7 +538,7 @@ send_fd_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
     cmsg->cmsg_type = SCM_RIGHTS;
     cmsg->cmsg_len = CMSG_LEN(sizeof(int) * num_fd);
 
-    fdptr = (int *) CMSG_DATA(cmsg);
+    int* fdptr = (int *) CMSG_DATA(cmsg);
     memcpy(fdptr, fds, num_fd * sizeof(int));
 
     struct iovec iov[1];
@@ -771,15 +553,16 @@ send_fd_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
         len = sendmsg(sd->fd, &msg, MSG_NOSIGNAL);
     } while (len < 0 && errno == EINTR);
 
-    if (len < 0)
-        return errno_error(env, errno);
+    int err = errno;
+    enif_mutex_unlock(sd->mtx);
 
-    afunix_data *data = priv_data(env);
+    if (len < 0)
+        return errno_error(env, err);
 
     if (len < bin.size)
-        return enif_make_tuple2(env, data->atom_ok, enif_make_uint(env, len));
+        return enif_make_tuple2(env, atom_ok, enif_make_uint(env, len));
 
-    return data->atom_ok;
+    return atom_ok;
 }
 
 
@@ -791,10 +574,18 @@ recv_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
     if (!get_socket(env, argv[0], &sd) || !enif_get_uint(env, argv[1], &size))
         return enif_make_badarg(env);
 
-    if (sd->fd == -1) return closed_error(env);
+    enif_mutex_lock(sd->mtx);
+
+    if (sd->fd == -1) {
+        enif_mutex_unlock(sd->mtx);
+        return closed_error(env);
+    }
 
     ErlNifBinary buf;
-    if (!enif_alloc_binary(size, &buf)) return enif_make_badarg(env);
+    if (!enif_alloc_binary(size, &buf)) {
+        enif_mutex_unlock(sd->mtx);
+        return enif_make_badarg(env);
+    }
 
     union {
         char ctrl_buf[CMSG_SPACE(sizeof(int) * MAX_FDS)];
@@ -820,13 +611,14 @@ recv_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
         len = recvmsg(sd->fd, &msg, MSG_CMSG_CLOEXEC);
     } while (len < 0 && errno == EINTR);
 
+    int err = errno;
+
+    enif_mutex_unlock(sd->mtx);
+
     if (len < 0) {
-        int err = errno;
         enif_release_binary(&buf);
         return errno_error(env, err);
     }
-
-    afunix_data *data = priv_data(env);
 
     ERL_NIF_TERM fd_list;
     unsigned fd_cnt = 0;
@@ -850,68 +642,29 @@ recv_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
 
     if (len == 0 && fd_cnt == 0) {
         enif_release_binary(&buf);
-        return enif_make_tuple2(env, data->atom_error, data->atom_closed);
+        return enif_make_tuple2(env, atom_error, atom_closed);
     }
 
     enif_realloc_binary(&buf, len);
     ERL_NIF_TERM recv_data = enif_make_binary(env, &buf);
 
     if (fd_cnt > 0)
-        return enif_make_tuple3(env, data->atom_ok, fd_list, recv_data);
+        return enif_make_tuple3(env, atom_ok, recv_data, fd_list);
 
-    return enif_make_tuple2(env, data->atom_ok, recv_data);
+    return enif_make_tuple2(env, atom_ok, recv_data);
 }
 
 
 static ERL_NIF_TERM
 close_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
 {
-    socket_data *sd = NULL;
-    int *fd;
+    socket_data *sd;
+    if (!get_socket(env, argv[0], &sd)) return enif_make_badarg(env);
 
-    if (get_socket(env, argv[0], &sd))
-        fd = &sd->fd;
-    else if (!get_fd(env, argv[0], &fd))
-        return enif_make_badarg(env);
+    int rc = close_socket(env, sd);
+    if (rc != 0) return errno_error(env, rc);
 
-    afunix_data *data = priv_data(env);
-
-    if (*fd == -1)
-        return enif_make_tuple2(env, data->atom_error, data->atom_closed);
-
-    if (sd != NULL) cancel_monitors(env, sd, true);
-
-    if (close(*fd) == -1)
-        return errno_error(env, errno);
-
-    *fd = -1;
-    return data->atom_ok;
-}
-
-
-static ERL_NIF_TERM
-fd_to_bin_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
-{
-    int *fd;
-    if (!get_fd(env, argv[0], &fd) || *fd == -1) return enif_make_badarg(env);
-
-    return enif_make_resource_binary(env, fd, fd, sizeof(int));
-}
-
-
-static ERL_NIF_TERM
-fd_from_bin_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
-{
-    ErlNifBinary bin;
-    if (!enif_inspect_binary(env, argv[0], &bin) || bin.size != sizeof(int))
-        return enif_make_badarg(env);
-
-    int old_fd = *(int* )bin.data;
-
-    int new_fd = dup(old_fd);
-    if (new_fd == -1) return enif_make_badarg(env);
-
-    return alloc_fd(env, new_fd);
+    return atom_ok;
 }
 
 
@@ -927,17 +680,15 @@ getsockopt_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
     socket_data *sd;
     if (!get_socket(env, argv[0], &sd)) return enif_make_badarg(env);
 
-    afunix_data *data = priv_data(env);
-
-    if (enif_is_identical(argv[1], data->atom_error)) {
+    if (enif_is_identical(argv[1], atom_error)) {
         optname = SO_ERROR;
         optval = &iopt;
         optlen = sizeof(int);
-    } else if (enif_is_identical(argv[1], data->atom_recbuf)) {
+    } else if (enif_is_identical(argv[1], atom_recbuf)) {
         optname = SO_RCVBUF;
         optval = &sopt;
         optlen = sizeof(size_t);
-    } else if (enif_is_identical(argv[1], data->atom_sndbuf)) {
+    } else if (enif_is_identical(argv[1], atom_sndbuf)) {
         optname = SO_SNDBUF;
         optval = &sopt;
         optlen = sizeof(size_t);
@@ -945,21 +696,37 @@ getsockopt_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
         return enif_make_badarg(env);
     }
 
-    if (getsockopt(sd->fd, SOL_SOCKET, optname, optval, &optlen) == -1)
-        return errno_exception(env, errno);
+    enif_mutex_lock(sd->mtx);
 
-    if (enif_is_identical(argv[1], data->atom_error)) {
-        return iopt == 0 ? data->atom_noerror
-                         : enif_make_atom(env, erl_errno_id(iopt));
-
-    } else if (enif_is_identical(argv[1], data->atom_recbuf)) {
-        return enif_make_uint(env, sopt);
-
-    } else if (enif_is_identical(argv[1], data->atom_sndbuf)) {
-        return enif_make_uint(env, sopt);
+    if (sd->fd == -1) {
+        enif_mutex_unlock(sd->mtx);
+        return closed_error(env);
     }
 
-    return enif_make_badarg(env);
+    if (getsockopt(sd->fd, SOL_SOCKET, optname, optval, &optlen) == -1) {
+        int err = errno;
+        enif_mutex_unlock(sd->mtx);
+        return errno_exception(env, err);
+    }
+
+    enif_mutex_unlock(sd->mtx);
+
+    ERL_NIF_TERM result;
+    if (enif_is_identical(argv[1], atom_error)) {
+        result = iopt == 0 ? atom_noerror
+                           : enif_make_atom(env, erl_errno_id(iopt));
+
+    } else if (enif_is_identical(argv[1], atom_recbuf)) {
+        result = enif_make_uint(env, sopt);
+
+    } else if (enif_is_identical(argv[1], atom_sndbuf)) {
+        result = enif_make_uint(env, sopt);
+
+    } else {
+        return enif_make_badarg(env);
+    }
+
+    return enif_make_tuple2(env, atom_ok, result);
 }
 
 
@@ -975,16 +742,14 @@ setsockopt_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
     socket_data *sd;
     if (!get_socket(env, argv[0], &sd)) return enif_make_badarg(env);
 
-    afunix_data *data = priv_data(env);
-
-    if (enif_is_identical(argv[1], data->atom_recbuf)
+    if (enif_is_identical(argv[1], atom_recbuf)
         && enif_get_uint(env, argv[2], &utmp)) {
         sopt = utmp;
         optname = SO_RCVBUF;
         optval = &sopt;
         optlen = sizeof(size_t);
 
-    } else if (enif_is_identical(argv[1], data->atom_sndbuf)
+    } else if (enif_is_identical(argv[1], atom_sndbuf)
         && enif_get_uint(env, argv[2], &utmp)) {
         sopt = utmp;
         optname = SO_SNDBUF;
@@ -995,102 +760,116 @@ setsockopt_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
         return enif_make_badarg(env);
     }
 
-    if (setsockopt(sd->fd, SOL_SOCKET, optname, optval, optlen) == -1)
-        return errno_exception(env, errno);
+    enif_mutex_lock(sd->mtx);
 
-    return data->atom_ok;
+    if (sd->fd == -1) {
+        enif_mutex_unlock(sd->mtx);
+        return closed_error(env);
+    }
+
+    if (setsockopt(sd->fd, SOL_SOCKET, optname, optval, optlen) == -1) {
+        int err = errno;
+        enif_mutex_unlock(sd->mtx);
+        return errno_exception(env, err);
+    }
+
+    enif_mutex_unlock(sd->mtx);
+
+    return atom_ok;
 }
 
 
 static ERL_NIF_TERM
-monitor_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
+select_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
 {
-    afunix_data *data = priv_data(env);
-
     socket_data *sd;
     if (!get_socket(env, argv[0], &sd)) return enif_make_badarg(env);
 
-    int event;
-    if (enif_is_identical(argv[1], data->atom_read))
-        event = MONITOR_READ;
-    else if (enif_is_identical(argv[1], data->atom_write))
-        event = MONITOR_WRITE;
+    enum ErlNifSelectFlags mode;
+    if (enif_is_identical(argv[1], atom_input))
+        mode = ERL_NIF_SELECT_READ;
+    else if (enif_is_identical(argv[1], atom_output))
+        mode = ERL_NIF_SELECT_WRITE;
     else
        return enif_make_badarg(env);
 
-    ERL_NIF_TERM ref = enif_make_ref(env);
+    enif_mutex_lock(sd->mtx);
 
-    enif_mutex_lock(data->lock);
-
-    monitor_data* mon = init_monitor_data(env, sd, event, ref);
-
-    if (mon == NULL) {
-        enif_mutex_unlock(data->lock);
-        return enif_make_badarg(env);
+    if (sd->fd == -1) {
+        enif_mutex_unlock(sd->mtx);
+        return closed_error(env);
     }
 
-    monitor_data** monptr = &data->monitors;
+    int rc = enif_select(env, sd->fd, mode, sd, NULL, argv[2]);
 
-    while (*monptr != NULL) monptr = &((*monptr)->next);
+    enif_mutex_unlock(sd->mtx);
 
-    *monptr = mon;
+    return rc >= 0 ? atom_ok : atom_error;
+}
 
-    wakeup_select_thread(data);
 
-    enif_mutex_unlock(data->lock);
+static ERL_NIF_TERM
+credentials_nif(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
+{
+    socket_data *sd;
+    if (!get_socket(env, argv[0], &sd)) return enif_make_badarg(env);
 
-    return ref;
+    enif_mutex_lock(sd->mtx);
+
+    if (sd->fd == -1) {
+        enif_mutex_unlock(sd->mtx);
+        return closed_error(env);
+    }
+
+    struct ucred creds;
+    socklen_t credslen = sizeof(struct ucred);
+
+    if (getsockopt(sd->fd, SOL_SOCKET, SO_PEERCRED, &creds, &credslen) == -1) {
+        int err = errno;
+        enif_mutex_unlock(sd->mtx);
+        return errno_exception(env, err);
+    }
+
+    enif_mutex_unlock(sd->mtx);
+
+    if (creds.pid == 0) {
+        return enif_make_tuple2(env, atom_ok, atom_undefined);
+    }
+
+    ERL_NIF_TERM pid = enif_make_long(env, creds.pid);
+    ERL_NIF_TERM uid = enif_make_long(env, creds.uid);
+    ERL_NIF_TERM gid = enif_make_long(env, creds.gid);
+    ERL_NIF_TERM creds_term = enif_make_tuple3(env, pid, uid, gid);
+    return enif_make_tuple2(env, atom_ok, creds_term);
 }
 
 
 static int onload(ErlNifEnv *env, void **priv_data, ERL_NIF_TERM load_info)
 {
-    ErlNifSysInfo sys_info;
-    enif_system_info(&sys_info, sizeof(ErlDrvSysInfo));
+    if (!init_resource_types(env, ERL_NIF_RT_CREATE))
+        return -1;
 
-    if (!sys_info.smp_support) return -1;
+    init_atoms(env);
 
-    afunix_data* data = init_priv_data(env, ERL_NIF_RT_CREATE);
-
-    if (data != NULL && !start_select_thread(data)) {
-        free_priv_data(data);
-        data = NULL;
-    }
-
-    *priv_data = data;
-    return data != NULL ? 0 : -1;
+    return 0;
 }
 
 
 static int upgrade(ErlNifEnv* env, void** priv_data, void** old_priv_data,
                    ERL_NIF_TERM load_info)
 {
-    afunix_data* data = init_priv_data(env, ERL_NIF_RT_TAKEOVER);
+    if (!init_resource_types(env, ERL_NIF_RT_TAKEOVER))
+        return -1;
 
-    if (data != NULL) {
-        if (start_select_thread(data)) {
-            upgrade_priv_data(*old_priv_data, data);
-        } else {
-            free_priv_data(data);
-            data = NULL;
-        }
-    }
+    init_atoms(env);
 
-    *priv_data = data;
-    return data != NULL ? 0 : -1;
-}
-
-
-static void unload(ErlNifEnv *env, void *priv_data)
-{
-    stop_select_thread((afunix_data *) priv_data);
-    free_priv_data((afunix_data *) priv_data);
+    return 0;
 }
 
 
 static ErlNifFunc nifs[] =
 {
-    {"socket",        0, socket_nif},
+    {"socket",        1, socket_nif},
     {"bind",          3, bind_nif},
     {"listen",        2, listen_nif},
     {"accept",        1, accept_nif},
@@ -1099,12 +878,11 @@ static ErlNifFunc nifs[] =
     {"send",          3, send_fd_nif},
     {"recv",          2, recv_nif},
     {"close",         1, close_nif},
-    {"fd_to_binary",  1, fd_to_bin_nif},
-    {"fd_from_binary",1, fd_from_bin_nif},
     {"getsockopt",    2, getsockopt_nif},
     {"setsockopt",    3, setsockopt_nif},
-    {"monitor",       2, monitor_nif},
+    {"select",        3, select_nif},
+    {"credentials",   1, credentials_nif},
 };
 
 
-ERL_NIF_INIT(afunix,nifs,onload,NULL,upgrade,unload)
+ERL_NIF_INIT(afunix,nifs,onload,NULL,upgrade,NULL)

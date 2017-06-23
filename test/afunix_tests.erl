@@ -41,19 +41,17 @@ send_receive_fd_test() ->
     C = socket(),
     ok = connect(C, Path),
 
-    Fd = memfd:create(),
+    Fd = memfd:new(),
     ok = memfd:pwrite(Fd, bof, <<1,2,3,4>>),
-    FdBin = memfd:fd_to_binary(Fd),
-    ok = send(C, [afunix:fd_from_binary(FdBin)], <<"data">>),
+    ok = send(C, <<"data">>, [memfd:fd(Fd)]),
 
     {ok, C1} = accept(S),
-    {ok, [Fd1], <<"data">>} = recv(C1, 100),
-    Fd1Bin = afunix:fd_to_binary(Fd1),
-    MemFd = memfd:fd_from_binary(Fd1Bin),
+    {ok, <<"data">>, [Fd1]} = recv(C1, 100),
+    MemFd = memfd:new(Fd1),
     ?assertMatch({ok, <<1,2,3,4>>}, memfd:pread(MemFd, 0, 4)).
 
 
-accept_monitor_test() ->
+accept_select_test() ->
     Path = socket_path(),
 
     S = socket(),
@@ -61,15 +59,16 @@ accept_monitor_test() ->
     ok = listen(S),
 
     {error, eagain} = accept(S),
-    Ref = afunix:monitor(S, read),
+    Ref = make_ref(),
+    ok = afunix:select(S, input, Ref),
 
     C = socket(),
     ok = connect(C, Path),
 
-    receive {afunix, Ref} -> {ok, _} = accept(S) end.
+    receive {select, S, Ref, ready_input} -> {ok, _} = accept(S) end.
 
 
-connect_monitor_test() ->
+connect_select_test() ->
     Path = socket_path(),
 
     S = socket(),
@@ -82,23 +81,25 @@ connect_monitor_test() ->
     C2 = socket(),
     {error, eagain} = connect(C2, Path),
 
-    Ref = afunix:monitor(C2, write),
+    Ref = make_ref(),
+    ok = afunix:select(C2, output, Ref),
 
     {ok, _} = accept(S),
-    receive {afunix, Ref} -> ok = connect(C2, Path) end.
+    receive {select, C2, Ref, ready_output} -> ok = connect(C2, Path) end.
 
 
-close_with_monitor_test() ->
+close_with_select_test() ->
     Path = socket_path(),
 
     S = socket(),
     ok = bind(S, Path),
     ok = listen(S),
 
-    Ref = afunix:monitor(S, read),
+    Ref = make_ref(),
+    ok = afunix:select(S, input, Ref),
     ok = afunix:close(S),
 
-    receive {afunix, Ref} -> {error, closed} = accept(S) end.
+    {error, _} = accept(S).
 
 
 socket_path() ->
